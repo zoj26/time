@@ -1,17 +1,20 @@
-// SideClock v0.2
+// SideClock v0.3
 // Left bar (top):  clock
-// Right bar (top): cell signal + Wi-Fi (if connected), battery underneath
+// Right bar (top): cell signal + Wi-Fi, battery underneath
 // Only shows in landscape. Touches pass straight through.
 
 #import <UIKit/UIKit.h>
+#import <Network/Network.h>
 
 // ---- Settings (edit these to tweak the look) ----
-static const CGFloat kClockSize   = 19.0;  // clock text size
-static const CGFloat kIconSize    = 13.0;  // signal / battery icon size
-static const CGFloat kPctSize     = 12.0;  // battery % text size
-static const CGFloat kTopCenter   = 37.0;  // how far down from the top edge things sit
-static const CGFloat kOpacity     = 0.92;  // 0 = invisible, 1 = solid white
-static const CGFloat kVideoAspect = 16.0 / 9.0; // assumed video shape for bar width
+static const BOOL    kStackedClock = YES;   // YES = hours above minutes, NO = one line with ":"
+static const BOOL    kDebug        = YES;   // YES = tiny diagnostic text under the battery
+static const CGFloat kClockSize    = 17.0;  // clock text size
+static const CGFloat kIconSize     = 14.0;  // signal / battery icon size
+static const CGFloat kPctSize      = 13.0;  // battery % text size
+static const CGFloat kTopCenter    = 38.0;  // how far down from the top edge things sit
+static const CGFloat kOpacity      = 0.92;  // 0 = invisible, 1 = solid white
+static const CGFloat kVideoAspect  = 16.0 / 9.0; // assumed video shape for bar width
 // --------------------------------------------------
 
 @interface SCPassthroughWindow : UIWindow
@@ -22,11 +25,13 @@ static const CGFloat kVideoAspect = 16.0 / 9.0; // assumed video shape for bar w
 @end
 
 static SCPassthroughWindow *gWindow;
-static UILabel *gClock;
+static UILabel *gClock, *gPct, *gDebug;
 static UIImageView *gCell, *gWifi, *gBattery;
-static UILabel *gPct;
 static NSDateFormatter *gFormatter;
-static UIView *gLocalStatusBar;   // hidden copy of iOS's status bar, used only to read signal data
+static UIView *gLocalStatusBar;          // hidden copy of iOS's status bar, used only to read signal data
+static nw_path_monitor_t gPathMonitor;   // fallback: knows if we're on Wi-Fi
+static volatile BOOL gOnWifi = NO;
+static NSString *gDebugText = @"";
 
 static UIColor *SCWhite(void) { return [UIColor colorWithWhite:1.0 alpha:kOpacity]; }
 
@@ -43,6 +48,15 @@ static UIImageView *SCIcon(void) {
     iv.tintColor = SCWhite();
     SCShadow(iv);
     return iv;
+}
+
+static UILabel *SCLabel(CGFloat size) {
+    UILabel *l = [UILabel new];
+    l.font = [UIFont monospacedDigitSystemFontOfSize:size weight:UIFontWeightSemibold];
+    l.textColor = SCWhite();
+    l.textAlignment = NSTextAlignmentCenter;
+    SCShadow(l);
+    return l;
 }
 
 static UIImage *SCSymbol(NSString *name, double value) {
@@ -62,31 +76,49 @@ static UIWindowScene *SCActiveScene(void) {
     return nil;
 }
 
-// ---------- Signal data (read from iOS's own status bar, safely) ----------
+// ---------- Signal data ----------
 
+static id SCTryKey(id obj, NSString *key) {
+    if (!obj) return nil;
+    @try { return [obj valueForKey:key]; } @catch (NSException *e) { return nil; }
+}
+
+// Tries several ways to reach iOS's status bar data. Records what happened in gDebugText.
 static id SCStatusData(UIWindowScene *scene) {
-    @try {
-        if (!gLocalStatusBar) {
-            id mgr = scene.statusBarManager;
-            if ([mgr respondsToSelector:NSSelectorFromString(@"createLocalStatusBar")])
-                gLocalStatusBar = [mgr valueForKey:@"createLocalStatusBar"];
-        }
-        id bar = gLocalStatusBar;
-        if ([bar respondsToSelector:NSSelectorFromString(@"statusBar")]) bar = [bar valueForKey:@"statusBar"];
-        if ([bar respondsToSelector:NSSelectorFromString(@"currentData")]) return [bar valueForKey:@"currentData"];
-    } @catch (NSException *e) {}
-    return nil;
+    if (!gLocalStatusBar) {
+        id mgr = scene.statusBarManager;
+        if ([mgr respondsToSelector:NSSelectorFromString(@"createLocalStatusBar")])
+            gLocalStatusBar = SCTryKey(mgr, @"createLocalStatusBar");
+        if (!gLocalStatusBar) { gDebugText = @"A:nobar"; return nil; }
+        // Put it (invisibly) in our window in case it only updates while on screen.
+        gLocalStatusBar.alpha = 0.0;
+        gLocalStatusBar.frame = CGRectMake(0, 0, 300, 30);
+    }
+    if (gLocalStatusBar.superview != gWindow) [gWindow addSubview:gLocalStatusBar];
+
+    id inner = SCTryKey(gLocalStatusBar, @"statusBar") ?: SCTryKey(gLocalStatusBar, @"_statusBar");
+    id data = nil;
+    for (id src in @[ inner ?: NSNull.null, gLocalStatusBar ]) {
+        if (src == NSNull.null) continue;
+        data = SCTryKey(src, @"currentAggregatedData") ?: SCTryKey(src, @"currentData") ?: SCTryKey(src, @"_currentData");
+        if (data) break;
+    }
+    if (!data) {
+        gDebugText = [NSString stringWithFormat:@"A:nodata %@/%@",
+                      NSStringFromClass([gLocalStatusBar class]), inner ? NSStringFromClass([inner class]) : @"-"];
+        return nil;
+    }
+    return data;
 }
 
 // Returns bars (0...max), or -1 if hidden/unknown.
 static NSInteger SCBars(id data, NSString *entryKey) {
-    @try {
-        id entry = [data valueForKey:entryKey];
-        if (!entry) return -1;
-        if (![[entry valueForKey:@"enabled"] boolValue]) return -1;
-        return [[entry valueForKey:@"displayValue"] integerValue];
-    } @catch (NSException *e) {}
-    return -1;
+    id entry = SCTryKey(data, entryKey);
+    if (!entry) return -1;
+    id enabled = SCTryKey(entry, @"enabled");
+    if (enabled && ![enabled boolValue]) return -1;
+    id value = SCTryKey(entry, @"displayValue") ?: SCTryKey(entry, @"rawValue");
+    return value ? [value integerValue] : -1;
 }
 
 // ---------- Building the overlay ----------
@@ -98,21 +130,19 @@ static void SCBuildWindow(UIWindowScene *scene) {
     gWindow.backgroundColor = UIColor.clearColor;
     gWindow.userInteractionEnabled = NO;
 
-    gClock = [UILabel new];
-    gClock.font = [UIFont monospacedDigitSystemFontOfSize:kClockSize weight:UIFontWeightSemibold];
-    gClock.textColor = SCWhite();
-    SCShadow(gClock);
+    gClock = SCLabel(kClockSize);
+    gClock.numberOfLines = 2;
     [gWindow addSubview:gClock];
 
     gCell = SCIcon();    [gWindow addSubview:gCell];
     gWifi = SCIcon();    [gWindow addSubview:gWifi];
     gBattery = SCIcon(); [gWindow addSubview:gBattery];
+    gPct = SCLabel(kPctSize); [gWindow addSubview:gPct];
 
-    gPct = [UILabel new];
-    gPct.font = [UIFont monospacedDigitSystemFontOfSize:kPctSize weight:UIFontWeightSemibold];
-    gPct.textColor = SCWhite();
-    SCShadow(gPct);
-    [gWindow addSubview:gPct];
+    gDebug = SCLabel(8.0);
+    gDebug.numberOfLines = 3;
+    gDebug.hidden = !kDebug;
+    [gWindow addSubview:gDebug];
 }
 
 // Lays out a row of views centered on (cx, cy) with a small gap between them.
@@ -166,12 +196,20 @@ static void SCUpdateSignal(UIWindowScene *scene) {
     id data = SCStatusData(scene);
     NSInteger cell = data ? SCBars(data, @"cellularEntry") : -1;
     NSInteger wifi = data ? SCBars(data, @"wifiEntry") : -1;
+    if (data) gDebugText = [NSString stringWithFormat:@"A:ok c%ld w%ld", (long)cell, (long)wifi];
+
+    // Fallback for Wi-Fi: if we couldn't read bars but we're on Wi-Fi, show a full icon.
+    BOOL wifiFallback = (wifi < 0 && gOnWifi);
+    if (wifiFallback) wifi = 3;
 
     gCell.hidden = (cell < 0);
     if (cell >= 0) gCell.image = SCSymbol(@"cellularbars", MIN(cell, 4) / 4.0);
 
     gWifi.hidden = (wifi < 0);
     if (wifi >= 0) gWifi.image = SCSymbol(@"wifi", MIN(wifi, 3) / 3.0);
+
+    if (kDebug) gDebug.text = [NSString stringWithFormat:@"%@\nnet:%@%@", gDebugText,
+                               gOnWifi ? @"wifi" : @"other", wifiFallback ? @" (fb)" : @""];
 }
 
 static void SCRefresh(void) {
@@ -195,7 +233,8 @@ static void SCRefresh(void) {
     }
 
     // Left bar: clock, centered in the bar
-    gClock.center = CGPointMake(barWidth / 2.0, kTopCenter);
+    CGFloat clockCY = kStackedClock ? kTopCenter + 5.0 : kTopCenter;
+    gClock.center = CGPointMake(barWidth / 2.0, clockCY);
 
     // Right bar: signal row on top, battery row below, centered in the bar
     SCUpdateSignal(scene);
@@ -203,6 +242,10 @@ static void SCRefresh(void) {
     CGFloat rightCX = W - barWidth / 2.0;
     SCRow(@[gCell, gWifi], rightCX, kTopCenter - 11.0);
     SCRow(@[gPct, gBattery], rightCX, kTopCenter + 11.0);
+
+    if (kDebug) {
+        gDebug.frame = CGRectMake(W - barWidth, kTopCenter + 24.0, barWidth, 40.0);
+    }
 
     gWindow.hidden = NO;
 }
@@ -215,11 +258,20 @@ static void SCRefresh(void) {
                 usingBlock:^(NSNotification *note) {
         UIDevice.currentDevice.batteryMonitoringEnabled = YES;
 
+        gPathMonitor = nw_path_monitor_create();
+        nw_path_monitor_set_queue(gPathMonitor, dispatch_get_main_queue());
+        nw_path_monitor_set_update_handler(gPathMonitor, ^(nw_path_t path) {
+            gOnWifi = nw_path_get_status(path) == nw_path_status_satisfied &&
+                      nw_path_uses_interface_type(path, nw_interface_type_wifi);
+        });
+        nw_path_monitor_start(gPathMonitor);
+
         // Follow the phone's 12h / 24h setting.
         NSString *pattern = [NSDateFormatter dateFormatFromTemplate:@"j" options:0 locale:NSLocale.currentLocale];
         BOOL twelveHour = [pattern containsString:@"a"];
+        NSString *hours = twelveHour ? @"hh" : @"HH";
         gFormatter = [NSDateFormatter new];
-        gFormatter.dateFormat = twelveHour ? @"hh:mm" : @"HH:mm";
+        gFormatter.dateFormat = [hours stringByAppendingString:(kStackedClock ? @"\nmm" : @":mm")];
 
         NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
             SCRefresh();
