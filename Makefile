@@ -8,6 +8,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = SideClock
 SideClock_FILES = Tweak.x
 SideClock_CFLAGS = -fobjc-arc
-SideClock_FRAMEWORKS = UIKit
+SideClock_FRAMEWORKS = UIKit Network
 
 include $(THEOS_MAKE_PATH)/tweak.mk
