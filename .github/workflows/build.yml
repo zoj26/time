@@ -1,0 +1,28 @@
+name: Build SideClock
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install ldid dpkg make
+
+      - name: Download Theos
+        run: git clone --recursive --depth 1 --shallow-submodules https://github.com/theos/theos.git "$HOME/theos"
+
+      - name: Build the .deb
+        run: |
+          export THEOS="$HOME/theos"
+          gmake package FINALPACKAGE=1
+
+      - name: Upload the .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideClock-deb
+          path: packages/*.deb
