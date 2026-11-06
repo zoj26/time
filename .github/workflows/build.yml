@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -21,8 +24,9 @@ jobs:
           export THEOS="$HOME/theos"
           gmake package FINALPACKAGE=1
 
-      - name: Upload the .deb
-        uses: actions/upload-artifact@v4
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
         with:
-          name: SideClock-deb
-          path: packages/*.deb
+          tag_name: build-${{ github.run_number }}
+          name: SideClock build ${{ github.run_number }}
+          files: packages/*.deb
