@@ -1,6 +1,6 @@
 Package: com.zoj26.sideclock
 Name: SideClock
-Version: 0.3.0
+Version: 0.4.0
 Architecture: iphoneos-arm64
 Description: Always-visible digital clock in the side bar while watching landscape video.
 Maintainer: zoj26
