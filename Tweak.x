@@ -11,7 +11,7 @@
 
 // ---- Settings (edit these to tweak the look) ----
 static const BOOL    kStackedClock = YES;   // YES = hours above minutes, NO = one line with ":"
-static const BOOL    kDebug        = YES;   // YES = tiny diagnostic text under the battery
+static const BOOL    kDebug        = NO;   // YES = tiny diagnostic text under the battery
 static const CGFloat kClockSize    = 17.0;  // clock text size
 static const CGFloat kIconSize     = 14.0;  // signal / battery icon size
 static const CGFloat kPctSize      = 13.0;  // battery % text size
