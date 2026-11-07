@@ -1,10 +1,13 @@
-// SideClock v0.3
+// SideClock v0.4
 // Left bar (top):  clock
 // Right bar (top): cell signal + Wi-Fi, battery underneath
+// Signal bars are read inside SpringBoard and shared with apps.
 // Only shows in landscape. Touches pass straight through.
 
 #import <UIKit/UIKit.h>
 #import <Network/Network.h>
+#import <notify.h>
+#import <objc/runtime.h>
 
 // ---- Settings (edit these to tweak the look) ----
 static const BOOL    kStackedClock = YES;   // YES = hours above minutes, NO = one line with ":"
@@ -17,6 +20,72 @@ static const CGFloat kOpacity      = 0.92;  // 0 = invisible, 1 = solid white
 static const CGFloat kVideoAspect  = 16.0 / 9.0; // assumed video shape for bar width
 // --------------------------------------------------
 
+#define SC_NOTIFY_NAME "com.zoj26.sideclock.signal"
+
+static BOOL gIsSpringBoard = NO;
+static int gToken = 0;
+static BOOL gTokenOK = NO;
+
+// Bars seen by status bar views in this process (-1 = unknown)
+static NSInteger gHookCell = -1, gHookWifi = -1;
+// Bars read directly from SpringBoard's managers (-1 = unknown)
+static NSInteger gPollCell = -1, gPollWifi = -1;
+
+static id SCTryKey(id obj, NSString *key) {
+    if (!obj) return nil;
+    @try { return [obj valueForKey:key]; } @catch (NSException *e) { return nil; }
+}
+
+// ================= SpringBoard side =================
+
+static void SCPublish(void) {
+    if (!gTokenOK) return;
+    NSInteger cell = gHookCell >= 0 ? gHookCell : gPollCell;
+    NSInteger wifi = gHookWifi >= 0 ? gHookWifi : gPollWifi;
+    uint64_t src = (gHookCell >= 0 ? 1 : 0) | (gHookWifi >= 0 ? 2 : 0) |
+                   (gPollCell >= 0 ? 4 : 0) | (gPollWifi >= 0 ? 8 : 0);
+    uint64_t c = cell < 0 ? 0xFF : (uint64_t)(cell & 0xFF);
+    uint64_t w = wifi < 0 ? 0xFF : (uint64_t)(wifi & 0xFF);
+    uint64_t state = (1ULL << 63) | c | (w << 8) | (src << 16);
+    notify_set_state(gToken, state);
+}
+
+static void SCPollSpringBoard(void) {
+    id wifiMgr = SCTryKey((id)objc_getClass("SBWiFiManager"), @"sharedInstance");
+    id w = SCTryKey(wifiMgr, @"signalStrengthBars");
+    gPollWifi = w ? [w integerValue] : -1;
+
+    id tel = SCTryKey((id)objc_getClass("SBTelephonyManager"), @"sharedTelephonyManager");
+    id c = SCTryKey(tel, @"signalStrengthBars");
+    if (!c) {
+        for (NSString *k in @[ @"_primarySubscriptionInfo", @"primarySubscriptionInfo", @"_primarySlotSubscriptionInfo" ]) {
+            c = SCTryKey(SCTryKey(tel, k), @"signalStrengthBars");
+            if (c) break;
+        }
+    }
+    gPollCell = c ? [c integerValue] : -1;
+}
+
+// Status bar signal views get told how many bars to light up. We listen in.
+static void SCRecordBars(id view, NSInteger n) {
+    NSString *cls = NSStringFromClass([view class]).lowercaseString;
+    if ([cls containsString:@"cellular"])  gHookCell = n;
+    else if ([cls containsString:@"wifi"]) gHookWifi = n;
+    else return;
+    if (gIsSpringBoard) SCPublish();
+}
+
+%group SignalHooks
+%hook _UIStatusBarSignalView
+- (void)setNumberOfActiveBars:(NSInteger)n {
+    %orig;
+    SCRecordBars(self, n);
+}
+%end
+%end
+
+// ================= App side (the overlay) =================
+
 @interface SCPassthroughWindow : UIWindow
 @end
 @implementation SCPassthroughWindow
@@ -28,10 +97,8 @@ static SCPassthroughWindow *gWindow;
 static UILabel *gClock, *gPct, *gDebug;
 static UIImageView *gCell, *gWifi, *gBattery;
 static NSDateFormatter *gFormatter;
-static UIView *gLocalStatusBar;          // hidden copy of iOS's status bar, used only to read signal data
-static nw_path_monitor_t gPathMonitor;   // fallback: knows if we're on Wi-Fi
+static nw_path_monitor_t gPathMonitor;   // knows if we're on Wi-Fi
 static volatile BOOL gOnWifi = NO;
-static NSString *gDebugText = @"";
 
 static UIColor *SCWhite(void) { return [UIColor colorWithWhite:1.0 alpha:kOpacity]; }
 
@@ -76,52 +143,16 @@ static UIWindowScene *SCActiveScene(void) {
     return nil;
 }
 
-// ---------- Signal data ----------
-
-static id SCTryKey(id obj, NSString *key) {
-    if (!obj) return nil;
-    @try { return [obj valueForKey:key]; } @catch (NSException *e) { return nil; }
+static BOOL SCReadShared(NSInteger *cell, NSInteger *wifi, uint64_t *src) {
+    if (!gTokenOK) return NO;
+    uint64_t s = 0;
+    if (notify_get_state(gToken, &s) != NOTIFY_STATUS_OK || !(s >> 63)) return NO;
+    uint64_t c = s & 0xFF, w = (s >> 8) & 0xFF;
+    *cell = (c == 0xFF) ? -1 : (NSInteger)c;
+    *wifi = (w == 0xFF) ? -1 : (NSInteger)w;
+    *src  = (s >> 16) & 0xFF;
+    return YES;
 }
-
-// Tries several ways to reach iOS's status bar data. Records what happened in gDebugText.
-static id SCStatusData(UIWindowScene *scene) {
-    if (!gLocalStatusBar) {
-        id mgr = scene.statusBarManager;
-        if ([mgr respondsToSelector:NSSelectorFromString(@"createLocalStatusBar")])
-            gLocalStatusBar = SCTryKey(mgr, @"createLocalStatusBar");
-        if (!gLocalStatusBar) { gDebugText = @"A:nobar"; return nil; }
-        // Put it (invisibly) in our window in case it only updates while on screen.
-        gLocalStatusBar.alpha = 0.0;
-        gLocalStatusBar.frame = CGRectMake(0, 0, 300, 30);
-    }
-    if (gLocalStatusBar.superview != gWindow) [gWindow addSubview:gLocalStatusBar];
-
-    id inner = SCTryKey(gLocalStatusBar, @"statusBar") ?: SCTryKey(gLocalStatusBar, @"_statusBar");
-    id data = nil;
-    for (id src in @[ inner ?: NSNull.null, gLocalStatusBar ]) {
-        if (src == NSNull.null) continue;
-        data = SCTryKey(src, @"currentAggregatedData") ?: SCTryKey(src, @"currentData") ?: SCTryKey(src, @"_currentData");
-        if (data) break;
-    }
-    if (!data) {
-        gDebugText = [NSString stringWithFormat:@"A:nodata %@/%@",
-                      NSStringFromClass([gLocalStatusBar class]), inner ? NSStringFromClass([inner class]) : @"-"];
-        return nil;
-    }
-    return data;
-}
-
-// Returns bars (0...max), or -1 if hidden/unknown.
-static NSInteger SCBars(id data, NSString *entryKey) {
-    id entry = SCTryKey(data, entryKey);
-    if (!entry) return -1;
-    id enabled = SCTryKey(entry, @"enabled");
-    if (enabled && ![enabled boolValue]) return -1;
-    id value = SCTryKey(entry, @"displayValue") ?: SCTryKey(entry, @"rawValue");
-    return value ? [value integerValue] : -1;
-}
-
-// ---------- Building the overlay ----------
 
 static void SCBuildWindow(UIWindowScene *scene) {
     gWindow.hidden = YES;
@@ -192,15 +223,17 @@ static void SCUpdateBattery(void) {
     gPct.text = [NSString stringWithFormat:@"%d%%", pct];
 }
 
-static void SCUpdateSignal(UIWindowScene *scene) {
-    id data = SCStatusData(scene);
-    NSInteger cell = data ? SCBars(data, @"cellularEntry") : -1;
-    NSInteger wifi = data ? SCBars(data, @"wifiEntry") : -1;
-    if (data) gDebugText = [NSString stringWithFormat:@"A:ok c%ld w%ld", (long)cell, (long)wifi];
+static void SCUpdateSignal(void) {
+    NSInteger cell = -1, wifi = -1;
+    uint64_t src = 0;
+    BOOL shared = SCReadShared(&cell, &wifi, &src);
+    NSInteger sbCell = cell, sbWifi = wifi;
 
-    // Fallback for Wi-Fi: if we couldn't read bars but we're on Wi-Fi, show a full icon.
-    BOOL wifiFallback = (wifi < 0 && gOnWifi);
-    if (wifiFallback) wifi = 3;
+    if (cell < 0) cell = gHookCell;   // fall back to this app's own status bar, if it has one
+    if (wifi < 0) wifi = gHookWifi;
+
+    if (!gOnWifi)      wifi = -1;     // only show Wi-Fi when actually connected to Wi-Fi
+    else if (wifi < 0) wifi = 3;      // connected but no bar count: show full
 
     gCell.hidden = (cell < 0);
     if (cell >= 0) gCell.image = SCSymbol(@"cellularbars", MIN(cell, 4) / 4.0);
@@ -208,8 +241,12 @@ static void SCUpdateSignal(UIWindowScene *scene) {
     gWifi.hidden = (wifi < 0);
     if (wifi >= 0) gWifi.image = SCSymbol(@"wifi", MIN(wifi, 3) / 3.0);
 
-    if (kDebug) gDebug.text = [NSString stringWithFormat:@"%@\nnet:%@%@", gDebugText,
-                               gOnWifi ? @"wifi" : @"other", wifiFallback ? @" (fb)" : @""];
+    if (kDebug) {
+        gDebug.text = [NSString stringWithFormat:@"sb:%@ c%ld w%ld\napp:c%ld w%ld net:%@",
+                       shared ? [NSString stringWithFormat:@"%llx", src] : @"none",
+                       (long)sbCell, (long)sbWifi, (long)gHookCell, (long)gHookWifi,
+                       gOnWifi ? @"wifi" : @"cell"];
+    }
 }
 
 static void SCRefresh(void) {
@@ -237,46 +274,66 @@ static void SCRefresh(void) {
     gClock.center = CGPointMake(barWidth / 2.0, clockCY);
 
     // Right bar: signal row on top, battery row below, centered in the bar
-    SCUpdateSignal(scene);
+    SCUpdateSignal();
     SCUpdateBattery();
     CGFloat rightCX = W - barWidth / 2.0;
     SCRow(@[gCell, gWifi], rightCX, kTopCenter - 11.0);
     SCRow(@[gPct, gBattery], rightCX, kTopCenter + 11.0);
 
-    if (kDebug) {
-        gDebug.frame = CGRectMake(W - barWidth, kTopCenter + 24.0, barWidth, 40.0);
-    }
+    if (kDebug) gDebug.frame = CGRectMake(W - barWidth, kTopCenter + 24.0, barWidth, 40.0);
 
     gWindow.hidden = NO;
 }
 
+static void SCStartApp(void) {
+    UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+
+    gPathMonitor = nw_path_monitor_create();
+    nw_path_monitor_set_queue(gPathMonitor, dispatch_get_main_queue());
+    nw_path_monitor_set_update_handler(gPathMonitor, ^(nw_path_t path) {
+        gOnWifi = nw_path_get_status(path) == nw_path_status_satisfied &&
+                  nw_path_uses_interface_type(path, nw_interface_type_wifi);
+    });
+    nw_path_monitor_start(gPathMonitor);
+
+    // Follow the phone's 12h / 24h setting.
+    NSString *pattern = [NSDateFormatter dateFormatFromTemplate:@"j" options:0 locale:NSLocale.currentLocale];
+    BOOL twelveHour = [pattern containsString:@"a"];
+    NSString *hours = twelveHour ? @"hh" : @"HH";
+    gFormatter = [NSDateFormatter new];
+    gFormatter.dateFormat = [hours stringByAppendingString:(kStackedClock ? @"\nmm" : @":mm")];
+
+    NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        SCRefresh();
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    SCRefresh();
+}
+
+static void SCStartSpringBoard(void) {
+    NSTimer *timer = [NSTimer timerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+        SCPollSpringBoard();
+        SCPublish();
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+}
+
 %ctor {
+    gIsSpringBoard = [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"];
+    gTokenOK = (notify_register_check(SC_NOTIFY_NAME, &gToken) == NOTIFY_STATUS_OK);
+
+    // Only hook if the class and method really exist on this iOS version.
+    Class sig = objc_getClass("_UIStatusBarSignalView");
+    if (sig && class_getInstanceMethod(sig, @selector(setNumberOfActiveBars:))) {
+        %init(SignalHooks);
+    }
+
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidFinishLaunchingNotification
                     object:nil
                      queue:NSOperationQueue.mainQueue
                 usingBlock:^(NSNotification *note) {
-        UIDevice.currentDevice.batteryMonitoringEnabled = YES;
-
-        gPathMonitor = nw_path_monitor_create();
-        nw_path_monitor_set_queue(gPathMonitor, dispatch_get_main_queue());
-        nw_path_monitor_set_update_handler(gPathMonitor, ^(nw_path_t path) {
-            gOnWifi = nw_path_get_status(path) == nw_path_status_satisfied &&
-                      nw_path_uses_interface_type(path, nw_interface_type_wifi);
-        });
-        nw_path_monitor_start(gPathMonitor);
-
-        // Follow the phone's 12h / 24h setting.
-        NSString *pattern = [NSDateFormatter dateFormatFromTemplate:@"j" options:0 locale:NSLocale.currentLocale];
-        BOOL twelveHour = [pattern containsString:@"a"];
-        NSString *hours = twelveHour ? @"hh" : @"HH";
-        gFormatter = [NSDateFormatter new];
-        gFormatter.dateFormat = [hours stringByAppendingString:(kStackedClock ? @"\nmm" : @":mm")];
-
-        NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-            SCRefresh();
-        }];
-        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
-        SCRefresh();
+        if (gIsSpringBoard) SCStartSpringBoard();
+        else                SCStartApp();
     }];
 }
