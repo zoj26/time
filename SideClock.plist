@@ -1,6 +1,7 @@
-{ Filter = { Bundles = (
-    "com.google.ios.youtube",
-    "com.apple.mobilesafari",
-    "com.apple.mobileslideshow",
-    "com.apple.tv"
-); }; }
+   { Filter = { Bundles = (
+       "com.apple.springboard",
+       "com.google.ios.youtube",
+       "com.apple.mobilesafari",
+       "com.apple.mobileslideshow",
+       "com.apple.tv"
+   ); }; }
