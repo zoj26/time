@@ -170,4 +170,250 @@ static UIWindowScene *SCActiveScene(void) {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if ([scene isKindOfClass:UIWindowScene.class] &&
             scene.activationState == UISceneActivationStateForegroundActive) {
-            return (UIWindowScene
+            return (UIWindowScene *)scene;
+        }
+    }
+    return nil;
+}
+
+static void SCUpdateFormatter(void) {
+    // Follow the phone's 12h / 24h setting.
+    NSString *pattern = [NSDateFormatter dateFormatFromTemplate:@"j" options:0 locale:NSLocale.currentLocale];
+    BOOL twelveHour = [pattern containsString:@"a"];
+    NSString *hours = twelveHour ? @"hh" : @"HH";
+    if (!gFormatter) gFormatter = [NSDateFormatter new];
+    gFormatter.dateFormat = [hours stringByAppendingString:(gStacked ? @"\nmm" : @":mm")];
+}
+
+// Returns YES if the settings changed since last time.
+static BOOL SCReadSettings(void) {
+    if (!gSetOK) return NO;
+    uint64_t s = 0;
+    if (notify_get_state(gSetToken, &s) != NOTIFY_STATUS_OK || !(s >> 63) || s == gLastSettings) return NO;
+    gLastSettings = s;
+    gClockSize   = (CGFloat)(s & 0xFF);
+    gIconSize    = (CGFloat)((s >> 8) & 0xFF);
+    gPctSize     = (CGFloat)((s >> 16) & 0xFF);
+    gTop         = (CGFloat)((s >> 24) & 0xFF);
+    gOpacity     = (CGFloat)((s >> 32) & 0xFF) / 100.0;
+    gStacked     = (s >> 40) & 1;
+    gShowClock   = (s >> 41) & 1;
+    gShowSignal  = (s >> 42) & 1;
+    gShowBattery = (s >> 43) & 1;
+    gDebugOn     = (s >> 44) & 1;
+    gEnabled     = (s >> 45) & 1;
+    return YES;
+}
+
+static BOOL SCReadSignal(NSInteger *cell, NSInteger *wifi, uint64_t *src) {
+    if (!gSigOK) return NO;
+    uint64_t s = 0;
+    if (notify_get_state(gSigToken, &s) != NOTIFY_STATUS_OK || !(s >> 63)) return NO;
+    uint64_t c = s & 0xFF, w = (s >> 8) & 0xFF;
+    *cell = (c == 0xFF) ? -1 : (NSInteger)c;
+    *wifi = (w == 0xFF) ? -1 : (NSInteger)w;
+    *src  = (s >> 16) & 0xFF;
+    return YES;
+}
+
+static void SCBuildWindow(UIWindowScene *scene) {
+    gWindow.hidden = YES;
+    gWindow = [[SCPassthroughWindow alloc] initWithWindowScene:scene];
+    gWindow.windowLevel = UIWindowLevelStatusBar + 100;
+    gWindow.backgroundColor = UIColor.clearColor;
+    gWindow.userInteractionEnabled = NO;
+
+    gClock = SCLabel(gClockSize);
+    gClock.numberOfLines = 2;
+    [gWindow addSubview:gClock];
+
+    gCell = SCIcon();    [gWindow addSubview:gCell];
+    gWifi = SCIcon();    [gWindow addSubview:gWifi];
+    gBattery = SCIcon(); [gWindow addSubview:gBattery];
+    gPct = SCLabel(gPctSize); [gWindow addSubview:gPct];
+
+    gDebug = SCLabel(8.0);
+    gDebug.numberOfLines = 3;
+    [gWindow addSubview:gDebug];
+}
+
+// Lays out a row of views centered on (cx, cy) with a small gap between them.
+static void SCRow(NSArray<UIView *> *views, CGFloat cx, CGFloat cy) {
+    CGFloat gap = 4.0, total = 0;
+    NSMutableArray *shown = [NSMutableArray array];
+    for (UIView *v in views) {
+        if (v.hidden) continue;
+        [v sizeToFit];
+        [shown addObject:v];
+        total += v.bounds.size.width;
+    }
+    if (shown.count == 0) return;
+    total += gap * (shown.count - 1);
+    CGFloat x = cx - total / 2.0;
+    for (UIView *v in shown) {
+        CGFloat w = v.bounds.size.width;
+        v.center = CGPointMake(x + w / 2.0, cy);
+        x += w + gap;
+    }
+}
+
+static void SCUpdateBattery(void) {
+    UIDevice *dev = UIDevice.currentDevice;
+    float level = dev.batteryLevel;   // 0.0 – 1.0, or -1 if unknown
+    if (!gShowBattery || level < 0) { gBattery.hidden = YES; gPct.hidden = YES; return; }
+    gBattery.hidden = NO; gPct.hidden = NO;
+
+    BOOL charging = dev.batteryState == UIDeviceBatteryStateCharging || dev.batteryState == UIDeviceBatteryStateFull;
+    int pct = (int)lroundf(level * 100);
+
+    NSString *name;
+    if (charging)        name = @"battery.100.bolt";
+    else if (pct >= 88)  name = @"battery.100";
+    else if (pct >= 63)  name = @"battery.75";
+    else if (pct >= 38)  name = @"battery.50";
+    else if (pct >= 13)  name = @"battery.25";
+    else                 name = @"battery.0";
+    gBattery.image = SCSymbol(name, -1);
+
+    UIColor *tint = SCWhite();   // same colours iOS uses
+    if (NSProcessInfo.processInfo.isLowPowerModeEnabled) tint = UIColor.systemYellowColor;
+    else if (charging)                                    tint = UIColor.systemGreenColor;
+    else if (pct <= 20)                                   tint = UIColor.systemRedColor;
+    gBattery.tintColor = tint;
+
+    gPct.text = [NSString stringWithFormat:@"%d%%", pct];
+}
+
+static void SCUpdateSignal(void) {
+    NSInteger cell = -1, wifi = -1;
+    uint64_t src = 0;
+    BOOL shared = SCReadSignal(&cell, &wifi, &src);
+    NSInteger sbCell = cell, sbWifi = wifi;
+
+    if (cell < 0) cell = gHookCell;   // fall back to this app's own status bar, if it has one
+    if (wifi < 0) wifi = gHookWifi;
+
+    if (!gOnWifi)      wifi = -1;     // only show Wi-Fi when actually connected to Wi-Fi
+    else if (wifi < 0) wifi = 3;      // connected but no bar count: show full
+
+    gCell.hidden = (!gShowSignal || cell < 0);
+    if (!gCell.hidden) gCell.image = SCSymbol(@"cellularbars", MIN(cell, 4) / 4.0);
+
+    gWifi.hidden = (!gShowSignal || wifi < 0);
+    if (!gWifi.hidden) gWifi.image = SCSymbol(@"wifi", MIN(wifi, 3) / 3.0);
+
+    gDebug.hidden = !gDebugOn;
+    if (gDebugOn) {
+        gDebug.text = [NSString stringWithFormat:@"sb:%@ c%ld w%ld\napp:c%ld w%ld net:%@",
+                       shared ? [NSString stringWithFormat:@"%llx", src] : @"none",
+                       (long)sbCell, (long)sbWifi, (long)gHookCell, (long)gHookWifi,
+                       gOnWifi ? @"wifi" : @"cell"];
+    }
+}
+
+static void SCRefresh(void) {
+    if (SCReadSettings()) {          // settings changed: rebuild with the new look
+        SCUpdateFormatter();
+        gWindow.hidden = YES;
+        gWindow = nil;
+    }
+
+    UIWindowScene *scene = SCActiveScene();
+    if (!gEnabled || !scene || !UIInterfaceOrientationIsLandscape(scene.interfaceOrientation)) {
+        gWindow.hidden = YES;
+        return;
+    }
+    if (!gWindow || gWindow.windowScene != scene) SCBuildWindow(scene);
+
+    CGRect bounds = scene.coordinateSpace.bounds;
+    gWindow.frame = bounds;
+    CGFloat W = bounds.size.width, H = bounds.size.height;
+    CGFloat barWidth = (W - H * kVideoAspect) / 2.0;   // width of each side bar
+
+    gClock.hidden = !gShowClock;
+    gClock.text = [gFormatter stringFromDate:[NSDate date]];
+    CGSize clockSize = [gClock sizeThatFits:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)];   // measure fresh every time
+    gClock.bounds = CGRectMake(0, 0, ceil(clockSize.width) + 2.0, ceil(clockSize.height));
+    CGFloat needed = gShowClock ? gClock.bounds.size.width + 8.0 : 40.0;
+    if (barWidth < needed) {         // no room, don't cover the video
+        gWindow.hidden = YES;
+        return;
+    }
+
+    // Left bar: clock, centered in the bar
+    CGFloat clockCY = gStacked ? gTop + 5.0 : gTop;
+    gClock.center = CGPointMake(barWidth / 2.0, clockCY);
+
+    // Right bar: signal row on top, battery row below (or just one, centered, if the other is off)
+    SCUpdateSignal();
+    SCUpdateBattery();
+    CGFloat rightCX = W - barWidth / 2.0;
+    BOOL sigShown = !gCell.hidden || !gWifi.hidden;
+    BOOL batShown = !gBattery.hidden;
+    if (sigShown && batShown) {
+        SCRow(@[gCell, gWifi], rightCX, gTop - 11.0);
+        SCRow(@[gPct, gBattery], rightCX, gTop + 11.0);
+    } else {
+        SCRow(@[gCell, gWifi], rightCX, gTop);
+        SCRow(@[gPct, gBattery], rightCX, gTop);
+    }
+
+    if (gDebugOn) gDebug.frame = CGRectMake(W - barWidth, gTop + 24.0, barWidth, 40.0);
+
+    gWindow.hidden = NO;
+}
+
+static void SCStartApp(void) {
+    UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+
+    gPathMonitor = nw_path_monitor_create();
+    nw_path_monitor_set_queue(gPathMonitor, dispatch_get_main_queue());
+    nw_path_monitor_set_update_handler(gPathMonitor, ^(nw_path_t path) {
+        gOnWifi = nw_path_get_status(path) == nw_path_status_satisfied &&
+                  nw_path_uses_interface_type(path, nw_interface_type_wifi);
+    });
+    nw_path_monitor_start(gPathMonitor);
+
+    SCReadSettings();
+    SCUpdateFormatter();
+
+    NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        SCRefresh();
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    SCRefresh();
+}
+
+static void SCStartSpringBoard(void) {
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, SCPrefsChanged,
+                                    SC_PREFS_CHANGED, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    SCPublishSettings();
+
+    NSTimer *timer = [NSTimer timerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+        SCPollSpringBoard();
+        SCPublishSignal();
+        SCPublishSettings();
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+}
+
+%ctor {
+    gIsSpringBoard = [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"];
+    gSigOK = (notify_register_check(SC_SIGNAL_NAME, &gSigToken) == NOTIFY_STATUS_OK);
+    gSetOK = (notify_register_check(SC_SETTINGS_NAME, &gSetToken) == NOTIFY_STATUS_OK);
+
+    // Only hook if the class and method really exist on this iOS version.
+    Class sig = objc_getClass("_UIStatusBarSignalView");
+    if (sig && class_getInstanceMethod(sig, @selector(setNumberOfActiveBars:))) {
+        %init(SignalHooks);
+    }
+
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidFinishLaunchingNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification *note) {
+        if (gIsSpringBoard) SCStartSpringBoard();
+        else                SCStartApp();
+    }];
+}
